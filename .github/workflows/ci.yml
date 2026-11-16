@@ -1,0 +1,390 @@
+name: TripSwarm AWS CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "README.md"
+
+  workflow_dispatch:
+
+concurrency:
+  group: tripswarm-production
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ============================================================
+  # 1. CONTINUOUS INTEGRATION
+  # ============================================================
+  test:
+    name: Continuous Integration
+    runs-on: ubuntu-latest
+    container:
+      image: python:3.11-slim
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            build-essential gcc g++ libpq-dev curl
+
+      - name: Install Python dependencies
+        run: |
+          pip install --upgrade pip --quiet
+          pip install --quiet -r requirements.txt
+
+      - name: Lint & syntax check
+        run: |
+          python -m compileall -q \
+            app.py backend.py database.py llm_providers.py \
+            mcp_client.py models.py rag_backend.py tools/
+          pip install flake8 --quiet
+          flake8 app.py backend.py database.py llm_providers.py \
+            mcp_client.py models.py rag_backend.py tools/ \
+            --max-line-length=120 --ignore=E501,W503,E402 --count || true
+
+      - name: Run tests
+        run: |
+          pip install pytest pytest-cov pytest-asyncio httpx --quiet
+          pytest tests/ \
+            --junitxml=reports/test-results.xml \
+            --cov=. \
+            --cov-report=xml:reports/coverage.xml \
+            -v
+
+      - name: Upload test results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-results
+          path: reports/
+
+
+  # ============================================================
+  # 2. BUILD AND PUSH IMAGE TO DOCKER HUB
+  # ============================================================
+  push_to_registry:
+    name: Build and Push Docker Image
+    needs: test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate Docker image settings
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          IMAGE_NAME: ${{ secrets.IMAGE_NAME }}
+        run: |
+          if [ -z "$DOCKER_USERNAME" ]; then
+            echo "DOCKER_USERNAME secret is missing."
+            exit 1
+          fi
+          if [ -z "$IMAGE_NAME" ]; then
+            echo "IMAGE_NAME secret is missing."
+            exit 1
+          fi
+          echo "Docker image settings are configured."
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ secrets.DOCKER_USERNAME }}/${{ secrets.IMAGE_NAME }}:main
+            ${{ secrets.DOCKER_USERNAME }}/${{ secrets.IMAGE_NAME }}:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+
+  # ============================================================
+  # 3. DEPLOY TO AWS EC2 VIA SSM
+  # ============================================================
+  deploy_aws:
+    name: Deploy to AWS EC2
+    needs: push_to_registry
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Validate application secrets
+        env:
+          CLOUDINARY_API_KEY: ${{ secrets.CLOUDINARY_API_KEY }}
+          CLOUDINARY_API_SECRET: ${{ secrets.CLOUDINARY_API_SECRET }}
+          CLOUDINARY_CLOUD_NAME: ${{ secrets.CLOUDINARY_CLOUD_NAME }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          EXA_API_KEY: ${{ secrets.EXA_API_KEY }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          LANGSMITH_TRACING: ${{ secrets.LANGSMITH_TRACING }}
+          LANGSMITH_ENDPOINT: ${{ secrets.LANGSMITH_ENDPOINT }}
+          LANGSMITH_API_KEY: ${{ secrets.LANGSMITH_API_KEY }}
+          LANGSMITH_PROJECT: ${{ secrets.LANGSMITH_PROJECT }}
+          MAILER_API_SECRET: ${{ secrets.MAILER_API_SECRET }}
+          MAILER_SERVICE_URL: ${{ secrets.MAILER_SERVICE_URL }}
+          PINECONE_API_KEY: ${{ secrets.PINECONE_API_KEY }}
+          PINECONE_INDEX_NAME: ${{ secrets.PINECONE_INDEX_NAME }}
+          PIXABAY_API_KEY: ${{ secrets.PIXABAY_API_KEY }}
+          SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          SERPAPI_API_KEY: ${{ secrets.SERPAPI_API_KEY }}
+        run: |
+          if [ -z "$CLOUDINARY_API_KEY" ]; then
+            echo "CLOUDINARY_API_KEY secret is missing."
+            exit 1
+          fi
+          if [ -z "$CLOUDINARY_API_SECRET" ]; then
+            echo "CLOUDINARY_API_SECRET secret is missing."
+            exit 1
+          fi
+          if [ -z "$CLOUDINARY_CLOUD_NAME" ]; then
+            echo "CLOUDINARY_CLOUD_NAME secret is missing."
+            exit 1
+          fi
+          if [ -z "$DATABASE_URL" ]; then
+            echo "DATABASE_URL secret is missing."
+            exit 1
+          fi
+          if [ -z "$EXA_API_KEY" ]; then
+            echo "EXA_API_KEY secret is missing."
+            exit 1
+          fi
+          if [ -z "$GOOGLE_CLIENT_ID" ]; then
+            echo "GOOGLE_CLIENT_ID secret is missing."
+            exit 1
+          fi
+          if [ -z "$GOOGLE_CLIENT_SECRET" ]; then
+            echo "GOOGLE_CLIENT_SECRET secret is missing."
+            exit 1
+          fi
+          if [ -z "$GROQ_API_KEY" ]; then
+            echo "GROQ_API_KEY secret is missing."
+            exit 1
+          fi
+          if [ -z "$LANGSMITH_TRACING" ]; then
+            echo "LANGSMITH_TRACING secret is missing."
+            exit 1
+          fi
+          if [ -z "$LANGSMITH_ENDPOINT" ]; then
+            echo "LANGSMITH_ENDPOINT secret is missing."
+            exit 1
+          fi
+          if [ -z "$LANGSMITH_API_KEY" ]; then
+            echo "LANGSMITH_API_KEY secret is missing."
+            exit 1
+          fi
+          if [ -z "$LANGSMITH_PROJECT" ]; then
+            echo "LANGSMITH_PROJECT secret is missing."
+            exit 1
+          fi
+          if [ -z "$MAILER_API_SECRET" ]; then
+            echo "MAILER_API_SECRET secret is missing."
+            exit 1
+          fi
+          if [ -z "$MAILER_SERVICE_URL" ]; then
+            echo "MAILER_SERVICE_URL secret is missing."
+            exit 1
+          fi
+          if [ -z "$PINECONE_API_KEY" ]; then
+            echo "PINECONE_API_KEY secret is missing."
+            exit 1
+          fi
+          if [ -z "$PINECONE_INDEX_NAME" ]; then
+            echo "PINECONE_INDEX_NAME secret is missing."
+            exit 1
+          fi
+          if [ -z "$PIXABAY_API_KEY" ]; then
+            echo "PIXABAY_API_KEY secret is missing."
+            exit 1
+          fi
+          if [ -z "$SECRET_KEY" ]; then
+            echo "SECRET_KEY secret is missing."
+            exit 1
+          fi
+          if [ -z "$SERPAPI_API_KEY" ]; then
+            echo "SERPAPI_API_KEY secret is missing."
+            exit 1
+          fi
+          echo "All required application secrets are configured."
+
+      - name: Pull latest Docker image on EC2 via SSM
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["docker pull ${{ secrets.DOCKER_USERNAME }}/${{ secrets.IMAGE_NAME }}:main"]' \
+            --output text \
+            --query "Command.CommandId")
+
+          echo "Pull command ID: $COMMAND_ID"
+
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}"
+
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query "Status" --output text)
+
+          echo "Pull status: $STATUS"
+
+          if [ "$STATUS" != "Success" ]; then
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+              --query "StandardErrorContent" --output text
+            exit 1
+          fi
+
+      - name: Stop existing container and run new one on EC2 via SSM
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands='[
+              "docker rm -f tripswarm 2>/dev/null || true",
+              "docker run -d --restart unless-stopped --name tripswarm -p 8000:8000 -e GOOGLE_API_KEY=${{ secrets.GOOGLE_API_KEY }} -e TAVILY_API_KEY=${{ secrets.TAVILY_API_KEY }} -e OPENWEATHER_API_KEY=${{ secrets.OPENWEATHER_API_KEY }} -e LANGSMITH_TRACING=${{ secrets.LANGSMITH_TRACING }} -e LANGSMITH_ENDPOINT=${{ secrets.LANGSMITH_ENDPOINT }} -e LANGSMITH_API_KEY=${{ secrets.LANGSMITH_API_KEY }} -e LANGSMITH_PROJECT=${{ secrets.LANGSMITH_PROJECT }} ${{ secrets.DOCKER_USERNAME }}/${{ secrets.IMAGE_NAME }}:main"
+            ]' \
+            --output text \
+            --query "Command.CommandId")
+
+          echo "Deploy command ID: $COMMAND_ID"
+
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}"
+
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query "Status" --output text)
+
+          echo "Deploy status: $STATUS"
+
+          if [ "$STATUS" != "Success" ]; then
+            aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+              --query "StandardErrorContent" --output text
+            exit 1
+          fi
+
+      - name: Verify container is running on EC2 via SSM
+        run: |
+          sleep 15
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "if ! docker ps --filter name=^tripswarm$ --filter status=running --format {{.Names}} | grep -q ^tripswarm$; then echo CONTAINER_NOT_RUNNING; docker logs --tail 50 tripswarm || true; exit 1; fi",
+              "echo Container is running.",
+              "docker ps --filter name=^tripswarm$"
+            ]' \
+            --output text \
+            --query "Command.CommandId")
+
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}"
+
+          OUTPUT=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query "StandardOutputContent" --output text)
+
+          echo "$OUTPUT"
+
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query "Status" --output text)
+
+          if [ "$STATUS" != "Success" ]; then
+            exit 1
+          fi
+
+      - name: Verify app health endpoint on EC2 via SSM
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=[
+              "for i in $(seq 1 12); do if curl -sf http://localhost:8000/health > /dev/null 2>&1; then echo TripSwarm application is healthy.; exit 0; fi; echo Waiting for app to become ready...; sleep 10; done; echo TripSwarm did not become healthy.; docker logs --tail 100 tripswarm || true; exit 1"
+            ]' \
+            --output text \
+            --query "Command.CommandId")
+
+          aws ssm wait command-executed \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}"
+
+          OUTPUT=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query "StandardOutputContent" --output text)
+
+          echo "$OUTPUT"
+
+          STATUS=$(aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query "Status" --output text)
+
+          if [ "$STATUS" != "Success" ]; then
+            exit 1
+          fi
+
+      - name: Show recent application logs via SSM
+        if: always()
+        run: |
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["docker logs --tail 50 tripswarm 2>/dev/null || true"]' \
+            --output text \
+            --query "Command.CommandId")
+
+          sleep 10
+
+          aws ssm get-command-invocation \
+            --command-id "$COMMAND_ID" \
+            --instance-id "${{ secrets.EC2_INSTANCE_ID }}" \
+            --query "StandardOutputContent" --output text || true
+
+      - name: Remove unused Docker images via SSM
+        if: always()
+        run: |
+          aws ssm send-command \
+            --instance-ids "${{ secrets.EC2_INSTANCE_ID }}" \
+            --document-name "AWS-RunShellScript" \
+            --parameters 'commands=["docker image prune -f"]' \
+            --output text \
+            --query "Command.CommandId"
